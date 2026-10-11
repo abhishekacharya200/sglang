@@ -20,8 +20,8 @@ use self::legacy::LegacyFormatter;
 pub use self::loader::load_chat_formatter;
 pub use self::models::DeepSeekV4Profile;
 use self::models::{
-    deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, render_deepseek_v4,
-    render_deepseek_v41,
+    deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, is_qwen38, render_deepseek_v4,
+    render_deepseek_v41, render_qwen38, takes_content_parts,
 };
 pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
@@ -48,6 +48,13 @@ pub enum ChatFormatter {
     },
     DeepSeekV4(DeepSeekV4Profile),
     DeepSeekV41,
+    /// Qwen3.8's Jinja template, which `render_request` renders as SGLang does.
+    Qwen38 {
+        formatter: PromptFormatter,
+        thinking: ThinkingTemplates,
+        /// SGLang hands the template content parts lists rather than strings.
+        content_parts: bool,
+    },
     Legacy(Box<LegacyFormatter>),
 }
 
@@ -65,7 +72,8 @@ impl ChatFormatter {
         request: &dyn OAIChatLikeRequest,
     ) -> Result<RenderedPrompt, TemplateError> {
         match self {
-            ChatFormatter::HuggingFace { formatter, .. } => render_oai(formatter, request),
+            ChatFormatter::HuggingFace { formatter, .. }
+            | ChatFormatter::Qwen38 { formatter, .. } => render_oai(formatter, request),
             ChatFormatter::KimiK25 { formatter, .. } => {
                 let mut args = request.chat_template_args().cloned().unwrap_or_default();
                 if let Some(tools) = request.tools() {
@@ -118,7 +126,8 @@ impl ChatFormatter {
     /// `chat_template_kwargs`, returning the prompt and the
     /// `continue_final_message` prefix SGLang tokenizes separately.
     /// The body must be one SGLang's `ChatCompletionRequest` accepts; it is not
-    /// re-validated. Only DeepSeek-V4 and V4.1 render this way; others use [`Self::render_prompt`].
+    /// re-validated. Only DeepSeek-V4, V4.1 and Qwen3.8 render this way; others use
+    /// [`Self::render_prompt`].
     pub fn render_request(
         &self,
         request: Value,
@@ -129,6 +138,11 @@ impl ChatFormatter {
                 render_deepseek_v4(*profile, request, default_kwargs)
             }
             ChatFormatter::DeepSeekV41 => render_deepseek_v41(request, default_kwargs),
+            ChatFormatter::Qwen38 {
+                formatter,
+                content_parts,
+                ..
+            } => render_qwen38(formatter, *content_parts, request, default_kwargs),
             _ => Err("this formatter renders through render_prompt".into()),
         }
         .map_err(|message| TemplateError::Renderer { message })
@@ -143,7 +157,8 @@ impl ChatFormatter {
             ChatFormatter::HuggingFace { .. }
             | ChatFormatter::KimiK25 { .. }
             | ChatFormatter::DeepSeekV4(_)
-            | ChatFormatter::DeepSeekV41 => None,
+            | ChatFormatter::DeepSeekV41
+            | ChatFormatter::Qwen38 { .. } => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
     }
@@ -158,7 +173,8 @@ impl ChatFormatter {
     ) -> Option<bool> {
         match self {
             ChatFormatter::HuggingFace { thinking, .. }
-            | ChatFormatter::KimiK25 { thinking, .. } => thinking
+            | ChatFormatter::KimiK25 { thinking, .. }
+            | ChatFormatter::Qwen38 { thinking, .. } => thinking
                 .for_request(tools_enabled)
                 .apply(args, named_tool_choice),
             ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41 => {

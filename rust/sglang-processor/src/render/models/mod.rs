@@ -3,6 +3,7 @@
 mod deepseek_v4;
 mod deepseek_v41;
 mod kimi_k25;
+mod qwen38;
 
 pub use self::deepseek_v4::DeepSeekV4Profile;
 pub(super) use self::deepseek_v4::{
@@ -10,3 +11,4 @@ pub(super) use self::deepseek_v4::{
 };
 pub(super) use self::deepseek_v41::render as render_deepseek_v41;
 pub(super) use self::kimi_k25::{deep_sort, encode_tools_to_typescript};
+pub(super) use self::qwen38::{is_qwen38, render as render_qwen38, takes_content_parts};

@@ -3,9 +3,9 @@
 
 //! Chat rendering via dynamo-render for cache-aware routing and input ID forwarding.
 //!
-//! Mirrors SGLang reasoning controls and assistant continuations; DeepSeek-V4
-//! and V4.1 render through `sglang_processor`. Forwarding remains guarded until parity
-//! has been verified for each request shape.
+//! Mirrors SGLang reasoning controls and assistant continuations; DeepSeek-V4,
+//! V4.1 and Qwen3.8 render through `sglang_processor`. Forwarding remains guarded
+//! until parity has been verified for each request shape.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,8 +41,8 @@ pub struct ChatFormatter {
     defaults: ChatTemplateKwargs,
     /// Stripped from a separately tokenized continuation prefix, as SGLang does.
     bos_token: Option<String>,
-    /// DeepSeek-V4 and V4.1 render through `sglang_processor`.
-    deepseek: Option<ProcessorFormatter>,
+    /// DeepSeek-V4, V4.1 and Qwen3.8 render through `sglang_processor`.
+    processor: Option<ProcessorFormatter>,
     is_kimi_k3: bool,
     /// Worker defaults, merged before model-specific effort conversion.
     worker_defaults: ChatTemplateKwargs,
@@ -97,7 +97,7 @@ impl ChatFormatter {
         files: &super::adapter::ModelFiles,
         config: &JsonValue,
     ) -> Result<()> {
-        if let Some(ProcessorFormatter::DeepSeekV4(profile)) = &mut self.deepseek {
+        if let Some(ProcessorFormatter::DeepSeekV4(profile)) = &mut self.processor {
             let profile_override = config
                 .get("dsv4_reasoning_effort_profile")
                 .filter(|v| !v.is_null())
@@ -166,6 +166,10 @@ impl ChatFormatter {
                 *entry = serde_json::json!({ name: template });
             }
         }
+        // Qwen3.8 renders through `sglang_processor`, which knows it by its template.
+        let processor = ProcessorFormatter::from_tokenizer_config(&cfg)
+            .ok()
+            .filter(|formatter| matches!(formatter, ProcessorFormatter::Qwen38 { .. }));
         let template: ChatTemplate =
             serde_json::from_value(cfg).context("parse tokenizer_config.json")?;
         if template.chat_template.is_none() {
@@ -179,7 +183,7 @@ impl ChatFormatter {
             formatter,
             defaults,
             bos_token,
-            deepseek: None,
+            processor,
             is_kimi_k3: false,
             worker_defaults: ChatTemplateKwargs::new(),
         }))
@@ -195,7 +199,7 @@ impl ChatFormatter {
             formatter,
             defaults: HashMap::new(),
             bos_token: Some("[BOS]".into()),
-            deepseek: None,
+            processor: None,
             is_kimi_k3: true,
             worker_defaults: ChatTemplateKwargs::new(),
         })
@@ -237,7 +241,7 @@ impl ChatFormatter {
             formatter,
             defaults,
             bos_token: Some("<｜begin▁of▁sentence｜>".into()),
-            deepseek: if is_deepseek_v41 {
+            processor: if is_deepseek_v41 {
                 Some(ProcessorFormatter::DeepSeekV41)
             } else {
                 is_deepseek_v4.then_some(ProcessorFormatter::DeepSeekV4(DeepSeekV4Profile::Preview))
@@ -247,9 +251,9 @@ impl ChatFormatter {
         })
     }
 
-    /// DeepSeek-V4 and V4.1 are fixture-verified against SGLang for every text chat.
+    /// DeepSeek-V4, V4.1 and Qwen3.8 are fixture-verified against SGLang for every text chat.
     pub fn forwarding_scope(&self) -> super::ForwardingScope {
-        match self.deepseek {
+        match self.processor {
             Some(_) => super::ForwardingScope::AllText,
             None => super::ForwardingScope::Guarded,
         }
@@ -342,10 +346,10 @@ impl ChatFormatter {
     /// Rendered prompt plus the assistant continuation prefix SGLang tokenizes
     /// separately (`_handle_last_assistant_message`).
     fn render_parts(&self, request: &JsonValue) -> Result<(RenderedPrompt, String)> {
-        if let Some(formatter) = &self.deepseek {
+        if let Some(formatter) = &self.processor {
             let (prompt, prefix) = formatter
                 .render_request(request.clone(), &self.worker_defaults)
-                .context("render DeepSeek chat")?;
+                .context("render chat")?;
             return Ok((RenderedPrompt::text(prompt), prefix));
         }
         let mut kwargs = self.template_kwargs(request)?;
@@ -725,6 +729,27 @@ mod tests {
         assert_eq!(enc.render(&req).unwrap(), "X");
         req["tools"] = json!([{"type": "function", "function": {"name": "f"}}]);
         assert_eq!(enc.render(&req).unwrap(), "T:1X");
+    }
+
+    /// Qwen3.8, known by its template, renders every text chat through `sglang_processor`:
+    /// text parts join with spaces and a later system turn fails, as in SGLang.
+    #[test]
+    fn qwen38_renders_through_the_processor() {
+        use crate::tokenizer::ForwardingScope;
+        let template = "{# <function= <parameter= preserve_thinking Reasoning effort is set to #}\
+            {% for m in messages %}{% if m.role == 'system' and not loop.first %}\
+            {{ raise_exception('System message must be at the beginning.') }}{% endif %}\
+            <|im_start|>{{ m.role }}|{{ m.content }}{% endfor %}";
+        let enc = jinja(json!({ "chat_template": template }));
+        assert_eq!(enc.forwarding_scope(), ForwardingScope::AllText);
+        let parts = json!([{"type": "text", "text": "A"}, {"type": "text", "text": "B"}]);
+        let req = request(json!([{"role": "user", "content": parts}]));
+        assert_eq!(enc.render(&req).unwrap(), "<|im_start|>user|A B");
+        let mid_system =
+            json!([{"role": "user", "content": "A"}, {"role": "system", "content": "B"}]);
+        assert!(enc.render(&request(mid_system)).is_err());
+        let other = jinja(json!({ "chat_template": template.replace("preserve_thinking", "") }));
+        assert_eq!(other.forwarding_scope(), ForwardingScope::Guarded);
     }
 
     #[test]
